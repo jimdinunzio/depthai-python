@@ -8,23 +8,43 @@ import time
 import os
 from datetime import timedelta
 
+
 # Weights to use when blending depth/rgb image (should equal 1.0)
 rgbWeight = 0.4
 depthWeight = 0.6
 
-# Closer-in minimum depth, disparity range is doubled (from 95 to 190):
-extended_disparity = False
-# Better accuracy for longer distance, fractional disparity 32-levels:
-subpixel = False
+# make cvColorMap the reverse of cv2.COLORMAP_HOT
+cvColorMap = cv2.COLORMAP_PLASMA
+cvColorMap = cv2.applyColorMap(np.arange(256, dtype=np.uint8), cvColorMap)
+cvColorMap = cvColorMap[::-1]
+cvColorMap[0] = [0, 0, 0]  # Set 0 to black
+
+cvDispColorMap = cv2.applyColorMap(np.arange(256, dtype=np.uint8), cv2.COLORMAP_JET)
+cvDispColorMap[0] = [0, 0, 0]  # Set 0 to black
+
+
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-sub', '--subpixel', action='store_true', help="Enable subpixel mode.")
-parser.add_argument('-ext', '--extended_disparity', action='store_true', help="Enable extended disparity mode.")
+parser.add_argument('-sub', '--subpixel', action='store_true', help="Use for better accuracy for longer distance.")
+parser.add_argument('-ext', '--extended_disparity', action='store_true', help="Use for closer-in minimum depth")
 parser.add_argument('-alpha', type=float, default=None, help="Alpha scaling parameter to increase float. [0,1] valid interval.")
+parser.add_argument('-post', '--post', action='store_true', help="Enable post processing")  # Enable post processing
+
+
 args = parser.parse_args()
 alpha = args.alpha
 subpixel = args.subpixel
 extended_disparity = args.extended_disparity
+post = args.post
+
+use_disparity = not post or subpixel # bug work around for disparity not correct size when post processing is enabled 
+if not use_disparity:
+    print("Due to bug disparity does not work with post processing unless subpixel is enabled")
+    exit(1)
+
+print("subpixel = ", subpixel)
+print("extended_disparity = ", extended_disparity)
+print("use_disparity = ", use_disparity)
 
 fps = 30
 # The disparity is computed at this resolution, then upscaled to RGB resolution
@@ -72,33 +92,33 @@ right.setResolution(monoResolution)
 right.setCamera("right")
 right.setFps(fps)
 
-
 # LR-check is required for depth alignment
 stereo.setLeftRightCheck(True)
-stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)
 # Options: MEDIAN_OFF, KERNEL_3x3, KERNEL_5x5, KERNEL_7x7 (default)
 stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
 stereo.setExtendedDisparity(extended_disparity)
 stereo.setSubpixel(subpixel)
-#stereo.setDepthAlign(DepthAdepthai.RawStereoDepthConfig.AlgorithmControl.DepthAlign.CENTER)
 stereo.setDepthAlign(rgbCamSocket)
 
-config = stereo.initialConfig.get()
-config.postProcessing.speckleFilter.enable = False
-config.postProcessing.speckleFilter.speckleRange = 28
-config.postProcessing.temporalFilter.enable = True
-config.postProcessing.spatialFilter.enable = True
-config.postProcessing.spatialFilter.holeFillingRadius = 2
-config.postProcessing.spatialFilter.numIterations = 1
-config.postProcessing.thresholdFilter.minRange = 400
-config.postProcessing.thresholdFilter.maxRange = 15000
-config.postProcessing.decimationFilter.decimationFactor = 1
-stereo.initialConfig.set(config)
+if post:
+    config = stereo.initialConfig.get()
+    config.postProcessing.speckleFilter.enable = False
+    config.postProcessing.speckleFilter.speckleRange = 28
+    config.postProcessing.temporalFilter.enable = True
+    config.postProcessing.spatialFilter.enable = True
+    config.postProcessing.spatialFilter.holeFillingRadius = 10
+    config.postProcessing.spatialFilter.numIterations = 1
+    #config.postProcessing.thresholdFilter.minRange = 200
+    #config.postProcessing.thresholdFilter.maxRange = 5000
+    config.postProcessing.decimationFilter.decimationFactor = 1
+    stereo.initialConfig.set(config)
 
 # Linking
 left.out.link(stereo.left)
 right.out.link(stereo.right)
 camRgb.video.link(sync.inputs["rgb"])
+#stereo.depth.link(sync.inputs["depth"])
 stereo.disparity.link(sync.inputs["disp"])
 sync.out.link(xoutGrp.input)
 
@@ -111,12 +131,10 @@ if alpha is not None:
 with device:
     device.startPipeline(pipeline)
 
-    frameRgb = None
-    frameDisp = None
-
     # Configure windows; trackbar adjusts blending ratio of rgb/depth
     rgbdWindowName = "rgbd"
     cv2.namedWindow(rgbdWindowName)
+    #print("max disparity: ", stereo.initialConfig.getMaxDisparity())
     disparityMultiplier = 255.0 / stereo.initialConfig.getMaxDisparity()
     queue = device.getOutputQueue("xout", 10, False)
 
@@ -128,38 +146,53 @@ with device:
     
         latestImage = {}
         latestImage["rgb"] = None
+        #latestImage["depth"] = None
         latestImage["disp"] = None
 
         msgGrp = queue.get()
         for name, msg in msgGrp:
             if name == "disp":
+                #print("disp width =", msg.getWidth(), "height = ", msg.getHeight(), "disp type is ", msg.getType())
                 frame = msg.getFrame()
-                frame = (frame * disparityMultiplier).astype(np.uint8)
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                latestImage[name] = np.ascontiguousarray(frame)
-
+                #frame = (frame * disparityMultiplier).astype(np.uint8)
+                latestImage[name] = frame
+                
+            # elif name == "depth":
+            #     frame = msg.getFrame()
+            #     latestImage[name] = frame
+        
             elif name == "rgb":
                 frame = msg.getCvFrame()
                 latestImage[name] = frame
                 
-            if latestImage["rgb"] is not None and latestImage["disp"] is not None:
-                resized_rgb = cv2.resize(latestImage["rgb"], (display_width, display_height))        
-                resized_disp = cv2.resize(latestImage["disp"], (display_width, display_height))
+            if latestImage["rgb"] is not None and latestImage["disp"] is not None:                
+                resized_rgb = cv2.resize(latestImage["rgb"], (display_width, display_height))
+                disp = (latestImage["disp"] * disparityMultiplier).astype(np.uint8)
+                resized_disp = cv2.resize(disp, (display_width, display_height))
+                resized_disp = cv2.applyColorMap(resized_disp, cvDispColorMap)
                 resized_concat_frame = cv2.hconcat([resized_rgb, resized_disp])
                 cv2.imshow(rgbdWindowName, resized_concat_frame)
                 
                 key = cv2.waitKey(1)
 
                 if key == ord('p'):
-                    print("rgb size: ", latestImage["rgb"].shape)
-                    #resized_disp = cv2.resize(latestImage["disp"], (latestImage["rgb"].shape[1], latestImage["rgb"].shape[0]))
-                    print("disp size: ", latestImage["disp"].shape)
-                    concat_frame = cv2.hconcat([latestImage["rgb"], latestImage["disp"]])
+                    dispFrame = (latestImage["disp"] << 3)
+                    rgbFrame = (latestImage["rgb"].astype(np.uint16) << 8)
+                    if len(dispFrame.shape) < 3:
+                        dispFrame = cv2.cvtColor(dispFrame, cv2.COLOR_GRAY2BGR)
+                    
+                    #print the min above 0 and max values in the depth
+                    # print("Min disparity value: ", np.min(dispFrame[dispFrame > 0]))
+                    # print("Max disparity value: ", np.max(dispFrame))
+                    
+                    #print shape of dispFrame and rgbFrame
+                    # print("dispFrame shape: ", dispFrame.shape)
+                    # print("rgbFrame shape: ", rgbFrame.shape)
+                    concat_frame = cv2.hconcat([rgbFrame, dispFrame])
 
                     filename = f"/home/{os.getlogin()}/Desktop/rgb_depth/frame_{int(time.time())}.png"
-                    cv2.imwrite(filename, concat_frame)
+                    cv2.imwrite(filename, concat_frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])  # Save as PNG
                     print(f"Saved frame to {filename}")
-
                     # Flash the screen white briefly
                     flash_frame = np.ones_like(resized_concat_frame) * 255
                     cv2.imshow(rgbdWindowName, flash_frame)
@@ -167,6 +200,7 @@ with device:
                 elif key == ord('q'):
                     break
                 latestImage["rgb"] = None
+                #latestImage["depth"] = None
                 latestImage["disp"] = None
         if key == ord('q'):
             break    
